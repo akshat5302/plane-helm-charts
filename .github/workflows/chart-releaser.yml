@@ -161,5 +161,90 @@ jobs:
             git commit -m "Updated READMEs"
             git push
           fi
+
+      - name: Collect released charts info
+        id: collect
+        run: |
+          if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL" ]; then
+            echo "SLACK_BOT_TOKEN or SLACK_CHANNEL not set, skipping notification"
+            exit 0
+          fi
+          set -e
+          git fetch origin --tags 2>/dev/null || true
+
+          SUMMARY_FILE="${{ github.workspace }}/release-summary.txt"
+          echo "*Helm Chart Release*" > "$SUMMARY_FILE"
+          echo "" >> "$SUMMARY_FILE"
+
+          for chart_dir in charts/*/; do
+              [ -f "${chart_dir}Chart.yaml" ] || continue
+              name=$(grep '^name:' "${chart_dir}Chart.yaml" | sed 's/^name:[[:space:]]*//' | tr -d '\r')
+              version=$(grep '^version:' "${chart_dir}Chart.yaml" | sed 's/^version:[[:space:]]*//' | tr -d '\r')
+              current_tag="${name}-${version}"
+
+              echo "*${name}* \`${version}\`" >> "$SUMMARY_FILE"
+
+              all_tags=$(git tag -l "${name}-*" 2>/dev/null | sort -V || true)
+              prev_tag=$(echo "$all_tags" | grep -F "${current_tag}" -B 1 | head -1 || true)
+
+              if [ -n "$prev_tag" ] && [ "$prev_tag" != "$current_tag" ]; then
+                commit_lines=$(gh api "repos/${{ github.repository }}/compare/${prev_tag}...${current_tag}" --jq '.commits[] | .commit.message | split("\n")[0]' -r 2>/dev/null || true)
+                if [ -n "$commit_lines" ]; then
+                  echo "$commit_lines" | while IFS= read -r msg; do [ -n "$msg" ] && echo "  • $msg" >> "$SUMMARY_FILE"; done
+                else
+                  echo "  • (no commits)" >> "$SUMMARY_FILE"
+                fi
+              else
+                echo "  • (first release or no previous tag)" >> "$SUMMARY_FILE"
+              fi
+              echo "" >> "$SUMMARY_FILE"
+            done
+  
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+        run: |
+          if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL" ]; then
+            echo "SLACK_BOT_TOKEN or SLACK_CHANNEL not set, skipping notification"
+            exit 0
+          fi
+
+          SUMMARY_FILE="${{ github.workspace }}/release-summary.txt"
+          [ -f "$SUMMARY_FILE" ] || { echo "No release summary found"; exit 0; }
+
+          # Build Block Kit payload with proper JSON escaping of summary text
+          SUMMARY_ESCAPED=$(jq -Rs . < "$SUMMARY_FILE")
+          WORKFLOW_LINK="<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>"
+          PAYLOAD=$(jq -n \
+            --arg channel "$SLACK_CHANNEL" \
+            --argjson text "$SUMMARY_ESCAPED" \
+            --arg link "$WORKFLOW_LINK" \
+            '{
+              channel: $channel,
+              text: "Helm Chart Release",
+              blocks: [
+                { type: "header", text: { type: "plain_text", text: "Helm Chart Release", emoji: true } },
+                { type: "section", text: { type: "mrkdwn", text: $text } },
+                { type: "context", elements: [{ type: "mrkdwn", text: $link }] }
+              ]
+            }')
+
+          HTTP_CODE=$(curl -s -o /tmp/slack_response.json -w "%{http_code}" -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Slack API returned HTTP $HTTP_CODE"
+            cat /tmp/slack_response.json
+            exit 1
+          fi
+          if grep -q '"ok":\s*false' /tmp/slack_response.json 2>/dev/null; then
+            echo "Slack API returned error:"
+            cat /tmp/slack_response.json
+            exit 1
+          fi
+          echo "Slack notification sent successfully."
   
 
